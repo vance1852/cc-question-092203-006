@@ -15,9 +15,19 @@ from matplotlib.patches import Polygon, Circle
 from matplotlib.colors import Normalize, LinearSegmentedColormap
 
 from ..constraints.boundary import SiteBoundary
+from ..constraints.exclusion import ExclusionZone
 from ..core.wind_resource import WindResource
 from ..farm.aep import FarmResult
 from ..optimization.ga import OptimizeResult
+
+
+# 不同类别禁建区的配色（填充色 / 边色）。
+_ZONE_STYLE = {
+    "shipping_lane": ("#f8c9c0", "#c0392b"),
+    "cable_corridor": ("#fde2b6", "#d68910"),
+    "ecological_buffer": ("#e3cff0", "#7d3c98"),
+    "other": ("#f5b7b1", "#922b21"),
+}
 
 
 def set_chinese_font() -> None:
@@ -36,6 +46,62 @@ def set_chinese_font() -> None:
     plt.rcParams["axes.unicode_minus"] = False
 
 
+def _draw_exclusion_zones(ax, zones: list[ExclusionZone]) -> None:
+    """在坐标轴上绘制禁建区本体及其安全净距轮廓（不同类别不同配色）。"""
+    labeled_kinds: set[str] = set()
+    for zone in zones:
+        face, edge = _ZONE_STYLE.get(zone.kind, _ZONE_STYLE["other"])
+
+        label = None
+        if zone.kind not in labeled_kinds:
+            label = zone.kind_label
+            labeled_kinds.add(zone.kind)
+
+        # 安全净距范围（不含风轮半径，仅配置净距），用虚线描出。
+        if zone.setback > 0:
+            buf_geom = zone.buffered(0.0)
+            buf_polys = (
+                list(buf_geom.geoms)
+                if buf_geom.geom_type == "MultiPolygon"
+                else [buf_geom]
+            )
+            for bp in buf_polys:
+                buffer_coords = np.asarray(bp.exterior.coords)
+                ax.plot(
+                    buffer_coords[:, 0],
+                    buffer_coords[:, 1],
+                    color=edge,
+                    linestyle="--",
+                    linewidth=1.0,
+                    alpha=0.7,
+                )
+
+        zone_poly = Polygon(
+            zone.vertices,
+            facecolor=face,
+            edgecolor=edge,
+            linewidth=1.8,
+            alpha=0.55,
+            hatch="//",
+            label=label,
+        )
+        ax.add_patch(zone_poly)
+
+        # 区域名称标注在区域内部（凹陷多边形用 representative_point
+        # 保证标注点落在区内）。
+        label_pt = zone.polygon.representative_point()
+        ax.text(
+            label_pt.x,
+            label_pt.y,
+            f"{zone.name}\n净距{zone.setback:.0f}m",
+            ha="center",
+            va="center",
+            fontsize=8,
+            color=edge,
+            fontweight="bold",
+        )
+
+
 def plot_farm_layout(
     positions: np.ndarray,
     boundary: SiteBoundary,
@@ -43,6 +109,7 @@ def plot_farm_layout(
     turbine_losses: Optional[np.ndarray] = None,
     turbine_names: Optional[list[str]] = None,
     wake_interactions: Optional[dict] = None,
+    exclusion_zones: Optional[list[ExclusionZone]] = None,
     title: str = "风电场机位布局",
     save_path: Optional[str] = None,
     show: bool = False,
@@ -74,15 +141,20 @@ def plot_farm_layout(
 
     fig, ax = plt.subplots(figsize=(10, 8))
 
+    # 租赁边界：淡绿填充 + 深绿粗边，和禁建区（红色系斜线填充）明确区分。
     poly = Polygon(
         boundary.vertices,
-        facecolor="lightgreen",
+        facecolor="#e8f6e3",
         edgecolor="darkgreen",
-        linewidth=2,
-        alpha=0.3,
-        label="场地边界",
+        linewidth=2.5,
+        alpha=0.6,
+        label="租赁边界",
+        zorder=1,
     )
     ax.add_patch(poly)
+
+    if exclusion_zones:
+        _draw_exclusion_zones(ax, exclusion_zones)
 
     if turbine_losses is not None:
         norm = Normalize(vmin=0, vmax=max(30.0, np.max(turbine_losses)))
@@ -90,7 +162,9 @@ def plot_farm_layout(
 
         for i, (pos, d, loss) in enumerate(zip(positions, rotor_diameters, turbine_losses)):
             color = cmap(norm(loss))
-            circle = Circle(pos, d / 2.0, facecolor=color, edgecolor="black", linewidth=1.5, alpha=0.8)
+            circle = Circle(pos, d / 2.0, facecolor=color, edgecolor="black",
+                            linewidth=1.5, alpha=0.9, zorder=4,
+                            label="最终机位" if i == 0 else None)
             ax.add_patch(circle)
 
             if turbine_names is not None:
@@ -110,7 +184,9 @@ def plot_farm_layout(
         cbar.set_label("尾流损失 (%)")
     else:
         for i, (pos, d) in enumerate(zip(positions, rotor_diameters)):
-            circle = Circle(pos, d / 2.0, facecolor="steelblue", edgecolor="darkblue", linewidth=1.5, alpha=0.7)
+            circle = Circle(pos, d / 2.0, facecolor="steelblue",
+                            edgecolor="darkblue", linewidth=1.5, alpha=0.9,
+                            zorder=4, label="最终机位" if i == 0 else None)
             ax.add_patch(circle)
 
             if turbine_names is not None:
@@ -594,6 +670,7 @@ def plot_wake_heatmap(
     rotor_diameters: np.ndarray,
     thrust_coefficients: np.ndarray,
     grid_resolution: int = 100,
+    exclusion_zones: Optional[list[ExclusionZone]] = None,
     title: str = "尾流速度亏损分布",
     save_path: Optional[str] = None,
     show: bool = False,
@@ -675,11 +752,18 @@ def plot_wake_heatmap(
 
     deficit_field = np.clip(deficit_field, 0.0, 1.0)
 
-    mask = np.zeros_like(deficit_field, dtype=bool)
-    for xi in range(grid_resolution):
-        for yi in range(grid_resolution):
-            pt = np.array([X[yi, xi], Y[yi, xi]])
-            mask[yi, xi] = not boundary.contains_point(pt)
+    # 向量化生成掩膜：租赁边界外及禁建区（含净距）内不绘制尾流场。
+    import shapely
+    lease_covers = shapely.contains_xy(
+        boundary.polygon, X.ravel(), Y.ravel()
+    ).reshape(X.shape)
+    mask = ~lease_covers
+    if exclusion_zones:
+        for zone in exclusion_zones:
+            in_zone = shapely.intersects_xy(
+                zone.buffered(0.0), X.ravel(), Y.ravel()
+            ).reshape(X.shape)
+            mask |= in_zone
 
     deficit_masked = np.ma.masked_where(mask, deficit_field)
 
@@ -693,10 +777,13 @@ def plot_wake_heatmap(
     poly = Polygon(
         boundary.vertices,
         facecolor="none",
-        edgecolor="black",
-        linewidth=2,
+        edgecolor="darkgreen",
+        linewidth=2.5,
     )
     ax.add_patch(poly)
+
+    if exclusion_zones:
+        _draw_exclusion_zones(ax, exclusion_zones)
 
     for pos, d in zip(positions, rotor_diameters):
         circle = Circle(pos, d / 2.0, facecolor="white", edgecolor="blue", linewidth=2)

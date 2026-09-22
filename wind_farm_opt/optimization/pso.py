@@ -1,16 +1,18 @@
 """粒子群优化器。"""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 import numpy as np
 
-from ..constraints.boundary import SiteBoundary
-from ..constraints.spacing import (
-    check_min_spacing,
-    compute_min_spacing_from_diameters,
-    enforce_min_spacing,
+from ..constraints.exclusion import (
+    FeasibleDomain,
+    InfeasibleLayoutError,
 )
+from ..constraints.spacing import (
+    compute_min_spacing_from_diameters,
+)
+from .ga import OptimizeResult
 
 
 @dataclass
@@ -48,6 +50,7 @@ class PSOConfig:
     min_spacing_multiple: float = 5.0
     penalty_factor: float = 1e6
     seed: Optional[int] = None
+    init_time_budget_s: float = 30.0
 
 
 class ParticleSwarmOptimizer:
@@ -57,13 +60,14 @@ class ParticleSwarmOptimizer:
         self,
         n_turbines: int,
         rotor_diameters: np.ndarray,
-        boundary: SiteBoundary,
+        domain: FeasibleDomain,
         fitness_fn: Callable[[np.ndarray], float],
         config: Optional[PSOConfig] = None,
     ) -> None:
         self.n_turbines = n_turbines
         self.rotor_diameters = np.asarray(rotor_diameters, dtype=np.float64)
-        self.boundary = boundary
+        self.domain = domain
+        self.boundary = domain.lease
         self.fitness_fn = fitness_fn
         self.config = config if config is not None else PSOConfig()
 
@@ -75,8 +79,8 @@ class ParticleSwarmOptimizer:
         )
 
         self.n_dim = n_turbines * 2
-        self.x_range = boundary.x_max - boundary.x_min
-        self.y_range = boundary.y_max - boundary.y_min
+        self.x_range = self.boundary.x_max - self.boundary.x_min
+        self.y_range = self.boundary.y_max - self.boundary.y_min
 
         self.vel_range = np.zeros(self.n_dim, dtype=np.float64)
         for i in range(self.n_dim):
@@ -87,9 +91,9 @@ class ParticleSwarmOptimizer:
         self.pos_bounds = np.zeros((self.n_dim, 2), dtype=np.float64)
         for i in range(self.n_dim):
             if i % 2 == 0:
-                self.pos_bounds[i] = [boundary.x_min, boundary.x_max]
+                self.pos_bounds[i] = [self.boundary.x_min, self.boundary.x_max]
             else:
-                self.pos_bounds[i] = [boundary.y_min, boundary.y_max]
+                self.pos_bounds[i] = [self.boundary.y_min, self.boundary.y_max]
 
         self._best_global_pos = None
         self._best_global_fitness = -np.inf
@@ -99,7 +103,7 @@ class ParticleSwarmOptimizer:
         self.mean_history: list[float] = []
 
     def _initialize_swarm(self, swarm_size: int) -> tuple[np.ndarray, np.ndarray]:
-        """初始化粒子群。"""
+        """初始化粒子群，初始位置全部满足约束。"""
         positions = np.zeros((swarm_size, self.n_dim), dtype=np.float64)
         velocities = np.zeros((swarm_size, self.n_dim), dtype=np.float64)
 
@@ -113,51 +117,30 @@ class ParticleSwarmOptimizer:
         return positions, velocities
 
     def _generate_valid_layout(self) -> np.ndarray:
-        """生成一个满足约束的初始布局。"""
-        max_attempts = 100
+        """生成一个满足租赁边界、禁建净距与间距约束的初始布局。"""
+        try:
+            return self.domain.sample_separated_points(
+                self.n_turbines,
+                self.min_spacing,
+                self.rng,
+                time_budget_s=self.config.init_time_budget_s,
+            )
+        except InfeasibleLayoutError:
+            raise
+        except Exception as exc:
+            raise InfeasibleLayoutError(
+                "无法生成满足约束的初始布局",
+                reasons=[str(exc)],
+            ) from exc
 
-        for _ in range(max_attempts):
-            try:
-                positions = self.boundary.sample_random_points(
-                    self.n_turbines, self.rng, max_attempts=50
-                )
-                valid, _ = check_min_spacing(positions, self.min_spacing)
-                if valid:
-                    return positions
-            except RuntimeError:
-                continue
-
-            try:
-                positions = self.boundary.sample_random_points(
-                    self.n_turbines, self.rng, max_attempts=50
-                )
-                positions = enforce_min_spacing(
-                    positions, self.min_spacing, self.boundary, self.rng
-                )
-                return positions
-            except RuntimeError:
-                continue
-
-        raise RuntimeError("无法生成满足约束的初始布局")
-
-    def _compute_penalty(self, positions_flat: np.ndarray) -> float:
-        """计算约束违反惩罚。"""
+    def _compute_penalty(self, positions_flat: np.ndarray) -> tuple[float, dict]:
+        """计算租赁边界/禁建净距/间距的连续距离惩罚。"""
         positions = positions_flat.reshape(self.n_turbines, 2)
-
-        penalty = 0.0
-
-        inside = self.boundary.contains_all(positions)
-        if not inside.all():
-            n_violations = np.sum(~inside)
-            penalty += n_violations * self.config.penalty_factor
-
-        valid, violations = check_min_spacing(positions, self.min_spacing)
-        if not valid:
-            for i, j in violations:
-                dist = np.linalg.norm(positions[i] - positions[j])
-                penalty += (self.min_spacing - dist) * self.config.penalty_factor
-
-        return penalty
+        return self.domain.penalty(
+            positions,
+            min_spacing=self.min_spacing,
+            factor=self.config.penalty_factor,
+        )
 
     def _evaluate_particles(self, positions: np.ndarray) -> np.ndarray:
         """评估所有粒子的适应度。"""
@@ -165,7 +148,7 @@ class ParticleSwarmOptimizer:
         fitness = np.zeros(swarm_size, dtype=np.float64)
 
         for i in range(swarm_size):
-            penalty = self._compute_penalty(positions[i])
+            penalty, _metrics = self._compute_penalty(positions[i])
 
             if penalty > 0:
                 fitness[i] = -penalty
@@ -179,25 +162,18 @@ class ParticleSwarmOptimizer:
         return fitness
 
     def _repair(self, positions_flat: np.ndarray) -> np.ndarray:
-        """修复违反约束的粒子。"""
+        """修复粒子：投影回可行域并推开间距不足的风机对。
+
+        无法修复时替换为一个全新的可行随机布局。
+        """
         positions = positions_flat.reshape(self.n_turbines, 2)
-
-        for i in range(self.n_turbines):
-            if not self.boundary.contains_point(positions[i]):
-                positions[i] = self.boundary.project_to_boundary(positions[i])
-
-        valid, _ = check_min_spacing(positions, self.min_spacing)
-        inside = self.boundary.contains_all(positions).all()
-
-        if not (valid and inside):
-            try:
-                positions = enforce_min_spacing(
-                    positions, self.min_spacing, self.boundary, self.rng
-                )
-            except RuntimeError:
-                pass
-
-        return positions.flatten()
+        try:
+            repaired = self.domain.repair_layout(
+                positions, min_spacing=self.min_spacing, rng=self.rng
+            )
+            return repaired.flatten()
+        except InfeasibleLayoutError:
+            return self._generate_valid_layout().flatten()
 
     def optimize(self, verbose: bool = True) -> "OptimizeResult":
         """执行优化。
@@ -207,8 +183,6 @@ class ParticleSwarmOptimizer:
         OptimizeResult
             优化结果
         """
-        from .ga import OptimizeResult
-
         swarm_size = self.config.swarm_size
         max_iter = self.config.max_iterations
 
@@ -224,9 +198,19 @@ class ParticleSwarmOptimizer:
             print(f"最小间距: {self.min_spacing:.1f} m "
                   f"({self.config.min_spacing_multiple:.1f}倍转子直径)")
             print(f"w={w}, c1={c1}, c2={c2}")
+            print(f"租赁面积: {self.boundary.area / 1e6:.2f} km²")
+            print(f"可行域面积: {self.domain.area / 1e6:.2f} km² "
+                  f"（含 {len(self.domain.zones)} 个禁建区）")
             print("=" * 35)
 
-        positions, velocities = self._initialize_swarm(swarm_size)
+        try:
+            positions, velocities = self._initialize_swarm(swarm_size)
+        except InfeasibleLayoutError as exc:
+            if verbose:
+                print("初始粒子群生成失败：布局问题不可行")
+                for reason in exc.reasons:
+                    print(f"  - {reason}")
+            raise
         fitness = self._evaluate_particles(positions)
 
         best_personal_pos = positions.copy()
@@ -293,6 +277,17 @@ class ParticleSwarmOptimizer:
             print(f"最优净AEP: {self._best_global_fitness/1e3:.2f} GWh")
             print(f"找到最优解的迭代: {self._best_iteration}")
 
+        # 最终把关：只返回真正可行的布局。
+        final_report = self.domain.validate_layout(
+            self._best_global_pos, self.min_spacing
+        )
+        if not final_report.feasible:
+            raise InfeasibleLayoutError(
+                "PSO 最终最优解仍违反约束",
+                reasons=final_report.reasons,
+                details={"report": final_report.to_dict()},
+            )
+
         return OptimizeResult(
             best_positions=self._best_global_pos.copy(),
             best_fitness=float(self._best_global_fitness),
@@ -301,4 +296,5 @@ class ParticleSwarmOptimizer:
             mean_history=self.mean_history.copy(),
             final_population=positions.copy(),
             final_fitness=fitness.copy(),
+            feasible=True,
         )

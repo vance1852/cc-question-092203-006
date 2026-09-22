@@ -1,206 +1,144 @@
-"""场地边界约束。
+"""场地租赁边界。
 
-支持任意多边形边界，使用射线法判断点是否在多边形内。
+支持任意（可凹陷）多边形边界，基于 shapely 做健壮的点包含、投影、
+面积计算，并提供严格的几何数据校验。
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
+from shapely.geometry import Polygon as ShapelyPolygon
+from shapely.geometry import Point
+from shapely.validation import explain_validity
+
+
+class GeometryValidationError(ValueError):
+    """几何数据校验失败。"""
+
+
+# 判定重复点/共线拼接时允许的坐标容差（米）。场地坐标量级为千米，
+# 1e-6 m 的容差足以识别数值噪声又不会误并真实顶点。
+_EPS = 1e-6
 
 
 @dataclass
 class SiteBoundary:
-    """场地边界类。
+    """场地租赁边界类。
 
-    使用闭合多边形定义场地范围。
+    使用闭合多边形定义租赁范围（允许凹陷）。内部持有一个 shapely
+    多边形用于几何运算，并暴露射线法风格的接口供其它模块使用。
 
     Parameters
     ----------
-    vertices : np.ndarray
+    vertices : array-like
         多边形顶点坐标，形状为 (N, 2)，单位为米。
         多边形会自动闭合，不需要重复起点。
+    name : str
+        边界名称（用于图表与结果标注）。
     """
 
     vertices: np.ndarray
+    name: str = "租赁边界"
 
     def __post_init__(self) -> None:
-        self.vertices = np.asarray(self.vertices, dtype=np.float64)
-        if self.vertices.ndim != 2 or self.vertices.shape[1] != 2:
-            raise ValueError("顶点坐标必须是形状为 (N, 2) 的数组")
-        if self.vertices.shape[0] < 3:
-            raise ValueError("多边形至少需要3个顶点")
+        verts = self._validate_vertices(np.asarray(self.vertices, dtype=np.float64))
+        object.__setattr__(self, "vertices", verts)
+        polygon = ShapelyPolygon(verts)
+        if not polygon.is_valid:
+            reason = explain_validity(polygon)
+            raise GeometryValidationError(f"租赁边界不是有效多边形: {reason}")
+        object.__setattr__(self, "_polygon", polygon)
+        object.__setattr__(self, "_exterior", polygon.exterior)
+
+    @staticmethod
+    def _validate_vertices(verts: np.ndarray) -> np.ndarray:
+        """严格校验顶点数据，返回去除闭合重复点后的顶点数组。"""
+        if verts.ndim != 2 or verts.shape[1] != 2:
+            raise GeometryValidationError("顶点坐标必须是形状为 (N, 2) 的数组")
+        if not np.isfinite(verts).all():
+            raise GeometryValidationError("顶点坐标包含 NaN 或无穷大")
+        if verts.shape[0] < 3:
+            raise GeometryValidationError("多边形至少需要3个不重复顶点")
+
+        # 去掉用户可能重复给出的闭合点（最后一个点等于第一个点）。
+        if np.allclose(verts[0], verts[-1], atol=_EPS, rtol=0.0):
+            verts = verts[:-1]
+        if verts.shape[0] < 3:
+            raise GeometryValidationError("多边形至少需要3个不重复顶点")
+
+        # 检查相邻重复点（含首尾），否则会产生退化边。
+        n = verts.shape[0]
+        for i in range(n):
+            j = (i + 1) % n
+            if np.linalg.norm(verts[j] - verts[i]) < _EPS:
+                raise GeometryValidationError(
+                    f"多边形存在重合相邻顶点: 顶点 {i} 与 {j} 坐标几乎相同"
+                )
+
+        area2 = 0.0
+        for i in range(n):
+            j = (i + 1) % n
+            area2 += verts[i, 0] * verts[j, 1] - verts[j, 0] * verts[i, 1]
+        if abs(area2) < _EPS:
+            raise GeometryValidationError(
+                "多边形有向面积为零（顶点可能共线，或自相交形成正负抵消）"
+            )
+
+        return verts
+
+    @property
+    def polygon(self) -> ShapelyPolygon:
+        """底层 shapely 多边形。"""
+        return self._polygon
 
     @property
     def x_min(self) -> float:
-        return float(np.min(self.vertices[:, 0]))
+        return float(self.vertices[:, 0].min())
 
     @property
     def x_max(self) -> float:
-        return float(np.max(self.vertices[:, 0]))
+        return float(self.vertices[:, 0].max())
 
     @property
     def y_min(self) -> float:
-        return float(np.min(self.vertices[:, 1]))
+        return float(self.vertices[:, 1].min())
 
     @property
     def y_max(self) -> float:
-        return float(np.max(self.vertices[:, 1]))
+        return float(self.vertices[:, 1].max())
+
+    @property
+    def bounds(self) -> tuple[float, float, float, float]:
+        return tuple(float(v) for v in self._polygon.bounds)
 
     @property
     def area(self) -> float:
-        """使用 shoelace 公式计算多边形面积。"""
-        x = self.vertices[:, 0]
-        y = self.vertices[:, 1]
-        n = len(x)
-        area = 0.0
-        for i in range(n):
-            j = (i + 1) % n
-            area += x[i] * y[j] - x[j] * y[i]
-        return float(abs(area) / 2.0)
+        """多边形面积（shoelace 与 shapely 一致）。"""
+        return float(self._polygon.area)
 
-    def contains_point(
-        self,
-        point: np.ndarray,
-        tolerance: float = 1e-9,
-    ) -> bool:
-        """判断点是否在多边形内部（射线法）。
-
-        Parameters
-        ----------
-        point : np.ndarray
-            点坐标，形状为 (2,)
-        tolerance : float
-            边界判定容差
-
-        Returns
-        -------
-        bool
-            True 表示点在多边形内部或边界上
-        """
-        pt = np.asarray(point, dtype=np.float64)
-        verts = self.vertices
-
-        if self._on_edge(pt, tolerance):
-            return True
-
-        n = len(verts)
-        inside = False
-        x, y = pt[0], pt[1]
-
-        for i in range(n):
-            j = (i + 1) % n
-            xi, yi = verts[i]
-            xj, yj = verts[j]
-
-            if ((yi > y) != (yj > y)):
-                x_intersect = (xj - xi) * (y - yi) / (yj - yi) + xi
-                if x <= x_intersect + tolerance:
-                    inside = not inside
-
-        return inside
-
-    def _on_edge(self, point: np.ndarray, tolerance: float) -> bool:
-        """检查点是否在多边形边界上。"""
-        verts = self.vertices
-        n = len(verts)
-
-        for i in range(n):
-            j = (i + 1) % n
-            if self._point_on_segment(point, verts[i], verts[j], tolerance):
-                return True
-        return False
-
-    @staticmethod
-    def _point_on_segment(
-        point: np.ndarray,
-        seg_start: np.ndarray,
-        seg_end: np.ndarray,
-        tolerance: float,
-    ) -> bool:
-        """判断点是否在线段上。"""
-        cross = (point[0] - seg_start[0]) * (seg_end[1] - seg_start[1]) - \
-                (point[1] - seg_start[1]) * (seg_end[0] - seg_start[0])
-        if abs(cross) > tolerance:
-            return False
-
-        dot = (point[0] - seg_start[0]) * (seg_end[0] - seg_start[0]) + \
-              (point[1] - seg_start[1]) * (seg_end[1] - seg_start[1])
-        if dot < -tolerance:
-            return False
-
-        len_sq = (seg_end[0] - seg_start[0]) ** 2 + (seg_end[1] - seg_start[1]) ** 2
-        if dot > len_sq + tolerance:
-            return False
-
-        return True
+    def contains_point(self, point: np.ndarray, tolerance: float = 1e-9) -> bool:
+        """判断塔位点是否在租赁边界内（含边界）。"""
+        pt = Point(np.asarray(point, dtype=np.float64))
+        return bool(
+            self._polygon.covers(pt)
+            or self._polygon.distance(pt) <= tolerance
+        )
 
     def contains_all(self, positions: np.ndarray) -> np.ndarray:
-        """批量检查多个点是否在多边形内部。
-
-        Parameters
-        ----------
-        positions : np.ndarray
-            点坐标，形状为 (N, 2)
-
-        Returns
-        -------
-        np.ndarray
-            布尔数组，形状为 (N,)
-        """
+        """批量检查点是否在租赁边界内，返回形状 (N,) 的布尔数组。"""
         positions = np.asarray(positions, dtype=np.float64)
-        result = np.zeros(positions.shape[0], dtype=bool)
-        for i, pt in enumerate(positions):
-            result[i] = self.contains_point(pt)
-        return result
+        return np.array([self.contains_point(p) for p in positions], dtype=bool)
 
-    def project_to_boundary(self, point: np.ndarray) -> np.ndarray:
-        """将点投影到多边形边界上（最近点）。
-
-        Parameters
-        ----------
-        point : np.ndarray
-            原始点坐标，形状为 (2,)
-
-        Returns
-        -------
-        np.ndarray
-            投影后的点坐标，形状为 (2,)
-        """
-        pt = np.asarray(point, dtype=np.float64)
-        verts = self.vertices
-        n = len(verts)
-
-        best_dist = np.inf
-        best_point = verts[0].copy()
-
-        for i in range(n):
-            j = (i + 1) % n
-            proj = self._project_to_segment(pt, verts[i], verts[j])
-            dist = np.linalg.norm(pt - proj)
-            if dist < best_dist:
-                best_dist = dist
-                best_point = proj
-
-        return best_point
-
-    @staticmethod
-    def _project_to_segment(
-        point: np.ndarray,
-        seg_start: np.ndarray,
-        seg_end: np.ndarray,
+    def project_to_boundary(
+        self, point: np.ndarray, inward: bool = True
     ) -> np.ndarray:
-        """将点投影到线段上。"""
-        seg_vec = seg_end - seg_start
-        seg_len_sq = np.dot(seg_vec, seg_vec)
-
-        if seg_len_sq < 1e-12:
-            return seg_start.copy()
-
-        t = np.dot(point - seg_start, seg_vec) / seg_len_sq
-        t = np.clip(t, 0.0, 1.0)
-
-        return seg_start + t * seg_vec
+        """返回边界上距该点最近的点；点在外则自动落在边界上。"""
+        pt = Point(np.asarray(point, dtype=np.float64))
+        nearest = self._exterior.interpolate(self._exterior.project(pt))
+        return np.array([nearest.x, nearest.y], dtype=np.float64)
 
     def sample_random_points(
         self,
@@ -208,42 +146,30 @@ class SiteBoundary:
         rng: Optional[np.random.Generator] = None,
         max_attempts: int = 100,
     ) -> np.ndarray:
-        """在多边形内随机采样点（拒绝采样）。
+        """在租赁边界内（不含禁建区——该方法不感知禁建区，仅保留兼容）。
 
-        Parameters
-        ----------
-        n_points : int
-            需要采样的点数
-        rng : Optional[np.random.Generator]
-            随机数生成器
-        max_attempts : int
-            每个点的最大尝试次数
-
-        Returns
-        -------
-        np.ndarray
-            采样点坐标，形状为 (n_points, 2)
+        禁建区感知的采样请使用
+        :meth:`wind_farm_opt.constraints.site.FeasibleDomain.sample_points`。
         """
         if rng is None:
             rng = np.random.default_rng()
 
         points = np.zeros((n_points, 2), dtype=np.float64)
-        x_min, x_max = self.x_min, self.x_max
-        y_min, y_max = self.y_min, self.y_max
+        x_min, y_min, x_max, y_max = self.bounds
 
         for i in range(n_points):
             found = False
             for _ in range(max_attempts):
-                x = rng.uniform(x_min, x_max)
-                y = rng.uniform(y_min, y_max)
-                pt = np.array([x, y])
+                pt = np.array([
+                    rng.uniform(x_min, x_max),
+                    rng.uniform(y_min, y_max),
+                ])
                 if self.contains_point(pt):
                     points[i] = pt
                     found = True
                     break
             if not found:
-                raise RuntimeError(f"无法在场地内采样到第 {i+1} 个点")
-
+                raise RuntimeError(f"无法在租赁边界内采样到第 {i + 1} 个点")
         return points
 
 
@@ -253,36 +179,19 @@ def create_rectangular_boundary(
     center_x: float = 0.0,
     center_y: float = 0.0,
 ) -> SiteBoundary:
-    """创建矩形场地边界。
-
-    Parameters
-    ----------
-    width : float
-        宽度（x方向）(m)
-    height : float
-        高度（y方向）(m)
-    center_x : float
-        中心x坐标 (m)
-    center_y : float
-        中心y坐标 (m)
-
-    Returns
-    -------
-    SiteBoundary
-        矩形场地边界
-    """
+    """创建矩形租赁边界。"""
+    if width <= 0 or height <= 0:
+        raise GeometryValidationError("矩形边界的宽度和高度必须为正数")
     x1 = center_x - width / 2.0
     x2 = center_x + width / 2.0
     y1 = center_y - height / 2.0
     y2 = center_y + height / 2.0
-
     vertices = np.array([
         [x1, y1],
         [x2, y1],
         [x2, y2],
         [x1, y2],
     ], dtype=np.float64)
-
     return SiteBoundary(vertices)
 
 
@@ -291,22 +200,9 @@ def create_hexagonal_boundary(
     center_x: float = 0.0,
     center_y: float = 0.0,
 ) -> SiteBoundary:
-    """创建正六边形场地边界。
-
-    Parameters
-    ----------
-    radius : float
-        外接圆半径 (m)
-    center_x : float
-        中心x坐标 (m)
-    center_y : float
-        中心y坐标 (m)
-
-    Returns
-    -------
-    SiteBoundary
-        六边形场地边界
-    """
+    """创建正六边形租赁边界。"""
+    if radius <= 0:
+        raise GeometryValidationError("六边形外接圆半径必须为正数")
     angles = np.deg2rad(np.arange(0, 360, 60))
     vertices = np.column_stack([
         center_x + radius * np.cos(angles),
@@ -316,13 +212,7 @@ def create_hexagonal_boundary(
 
 
 def create_irregular_boundary() -> SiteBoundary:
-    """创建一个不规则多边形场地边界作为示例。
-
-    Returns
-    -------
-    SiteBoundary
-        不规则场地边界
-    """
+    """创建一个不规则（凹陷）多边形租赁边界作为示例。"""
     vertices = np.array([
         [0.0, 0.0],
         [3000.0, -200.0],

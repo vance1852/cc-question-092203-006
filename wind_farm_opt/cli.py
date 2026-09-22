@@ -13,10 +13,10 @@ from typing import Optional
 import numpy as np
 
 from .config import WindFarmConfig, create_sample_config
-from .core.turbine import Turbine
-from .core.wind_resource import WindResource
-from .core.wake import WakeModel
-from .constraints.boundary import SiteBoundary
+from .constraints.exclusion import (
+    FeasibleDomain,
+    InfeasibleLayoutError,
+)
 from .farm.aep import AEPCalculator, FarmResult
 from .optimization.baseline import generate_grid_layout
 from .optimization.ga import GeneticAlgorithm, GAConfig
@@ -53,6 +53,17 @@ class WindFarmOptimizerCLI:
         self.rotor_diameters = np.array([t.rotor_diameter for t in self.turbines])
         self.rated_powers = np.array([t.rated_power for t in self.turbines])
         self.thrust_coefficients = np.array([t.thrust_coefficient for t in self.turbines])
+
+        # 可行域 = 租赁边界 − 航道/海缆/生态缓冲等禁建区（含各自净距）。
+        # 缓冲按风轮半径外扩，保证“风轮边缘”保持配置的安全净距。
+        rotor_radius = float(np.max(self.rotor_diameters)) / 2.0
+        self.exclusion_zones = config.create_exclusion_zones()
+        self.domain = FeasibleDomain(
+            lease=self.boundary,
+            zones=self.exclusion_zones,
+            rotor_radius=rotor_radius,
+            lease_setback=config.lease_setback,
+        )
 
         self.aep_calc = AEPCalculator(
             turbines=self.turbines,
@@ -102,14 +113,14 @@ class WindFarmOptimizerCLI:
 
         rng = np.random.default_rng(self.config.optimization.seed)
         self.baseline_positions = generate_grid_layout(
-            boundary=self.boundary,
+            domain=self.domain,
             n_turbines=self.config.n_turbines,
             rotor_diameters=self.rotor_diameters,
             min_multiple=self.config.optimization.min_spacing_multiple,
             rng=rng,
         )
 
-        print(f"已生成 {self.config.n_turbines} 台风机的网格布局")
+        print(f"已在可行域内生成 {self.config.n_turbines} 台风机的网格布局")
 
         self.baseline_result = self.aep_calc.compute_farm_aep(self.baseline_positions)
         self._print_result_summary(self.baseline_result, "基线布局")
@@ -132,7 +143,7 @@ class WindFarmOptimizerCLI:
             optimizer = GeneticAlgorithm(
                 n_turbines=self.config.n_turbines,
                 rotor_diameters=self.rotor_diameters,
-                boundary=self.boundary,
+                domain=self.domain,
                 fitness_fn=fit_fn,
                 config=ga_config,
             )
@@ -146,7 +157,7 @@ class WindFarmOptimizerCLI:
             optimizer = ParticleSwarmOptimizer(
                 n_turbines=self.config.n_turbines,
                 rotor_diameters=self.rotor_diameters,
-                boundary=self.boundary,
+                domain=self.domain,
                 fitness_fn=fit_fn,
                 config=pso_config,
             )
@@ -268,7 +279,7 @@ class WindFarmOptimizerCLI:
 
             try:
                 positions = generate_grid_layout(
-                    boundary=self.boundary,
+                    domain=self.domain,
                     n_turbines=n,
                     rotor_diameters=self.rotor_diameters,
                     min_multiple=self.config.optimization.min_spacing_multiple,
@@ -289,8 +300,12 @@ class WindFarmOptimizerCLI:
                 sweep_data["lcoe"].append(econ_result.lcoe)
 
                 print(f"    净AEP: {result.net_aep/1e3:.1f} GWh, LCOE: {econ_result.lcoe:.3f} 元/kWh")
+            except InfeasibleLayoutError as exc:
+                print(f"    不可行，停止扫描: {exc.reasons[0] if exc.reasons else exc}")
+                break
             except Exception as e:
                 print(f"    跳过: {e}")
+                break
 
         self.sweep_results = sweep_data
         self.config.n_turbines = original_n
@@ -321,7 +336,8 @@ class WindFarmOptimizerCLI:
                 rotor_diameters=self.rotor_diameters,
                 turbine_losses=baseline_losses,
                 turbine_names=[f"#{i}" for i in range(len(self.baseline_positions))],
-                title="基线网格布局 - 尾流损失分布",
+                exclusion_zones=self.exclusion_zones,
+                title="基线网格布局 - 租赁边界/禁建区/机位",
                 save_path=os.path.join(save_dir, "baseline_layout.png") if save else None,
                 show=show,
             )
@@ -341,7 +357,8 @@ class WindFarmOptimizerCLI:
                 rotor_diameters=self.rotor_diameters,
                 turbine_losses=opt_losses,
                 turbine_names=[f"#{i}" for i in range(len(self.optimized_positions))],
-                title="优化后布局 - 尾流损失分布",
+                exclusion_zones=self.exclusion_zones,
+                title="优化后布局 - 租赁边界/禁建区/机位",
                 save_path=os.path.join(save_dir, "optimized_layout.png") if save else None,
                 show=show,
             )
@@ -390,6 +407,7 @@ class WindFarmOptimizerCLI:
                 wind_direction=dominant_dir,
                 rotor_diameters=self.rotor_diameters,
                 thrust_coefficients=self.thrust_coefficients,
+                exclusion_zones=self.exclusion_zones,
                 title=f"主风向({dominant_dir:.0f}°)尾流速度亏损分布",
                 save_path=os.path.join(save_dir, "wake_heatmap.png") if save else None,
                 show=show,
@@ -409,8 +427,14 @@ class WindFarmOptimizerCLI:
                 "min_spacing_multiple": self.config.optimization.min_spacing_multiple,
             },
             "site": {
-                "area_km2": float(self.boundary.area / 1e6),
+                "lease_area_km2": float(self.boundary.area / 1e6),
+                "feasible_area_km2": float(self.domain.area / 1e6),
+                "excluded_area_km2": float(
+                    (self.boundary.area - self.domain.area) / 1e6
+                ),
                 "mean_wind_speed": float(self.wind_resource.overall_mean_speed),
+                "lease_setback_m": float(self.config.lease_setback),
+                "exclusion_zones": [z.to_dict() for z in self.exclusion_zones],
             },
         }
 
@@ -506,7 +530,17 @@ class WindFarmOptimizerCLI:
         print(f"  风机: {self.config.turbine_model} x {self.config.n_turbines} 台")
         print(f"  尾流模型: {self.config.wake_model}")
         print(f"  平均风速: {self.wind_resource.overall_mean_speed:.2f} m/s")
-        print(f"  场地面积: {self.boundary.area / 1e6:.2f} km²")
+        print(f"  租赁面积: {self.boundary.area / 1e6:.2f} km²")
+        print(f"  可行域面积: {self.domain.area / 1e6:.2f} km²")
+        if self.exclusion_zones:
+            print(f"  禁建区 ({len(self.exclusion_zones)} 个):")
+            for zone in self.exclusion_zones:
+                print(
+                    f"    - {zone.name} [{zone.kind_label}] "
+                    f"面积 {zone.area/1e6:.3f} km², 安全净距 {zone.setback:.0f} m"
+                )
+        else:
+            print("  禁建区: 无")
 
         if run_baseline:
             self.run_baseline()
@@ -796,11 +830,46 @@ def main() -> int:
             save=True,
         )
         return 0
+    except InfeasibleLayoutError as exc:
+        print("\n" + "=" * 60, file=sys.stderr)
+        print("布局不可行：在当前禁建区与安全净距下无法完成布置", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+        for reason in exc.reasons or [str(exc)]:
+            print(f"  - {reason}", file=sys.stderr)
+        print("\n建议：减少风机台数、放宽安全净距，或核查禁建区坐标。",
+              file=sys.stderr)
+        _write_failure_report(config, exc)
+        return 2
     except Exception as e:
         print(f"\n错误: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
         return 1
+
+
+def _write_failure_report(config: WindFarmConfig,
+                          exc: InfeasibleLayoutError) -> None:
+    """把带具体约束原因的失败写入输出目录，便于选址人员排查。"""
+    output_dir = config.visualization.save_dir
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, "failure.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "status": "infeasible",
+                    "message": str(exc),
+                    "reasons": exc.reasons,
+                    "details": exc.details,
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
+        print(f"失败原因已保存到: {os.path.abspath(path)}", file=sys.stderr)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

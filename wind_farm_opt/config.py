@@ -14,10 +14,12 @@ from .core.wind_resource import WindResource, create_default_wind_resource
 from .core.wake import JensenWake, GaussianWake, WakeModel
 from .constraints.boundary import (
     SiteBoundary,
+    GeometryValidationError,
     create_rectangular_boundary,
     create_hexagonal_boundary,
     create_irregular_boundary,
 )
+from .constraints.exclusion import ExclusionZone, FeasibleDomain
 
 
 @dataclass
@@ -64,6 +66,19 @@ class WindFarmConfig:
         "center_y": 0,
     })
 
+    #: 租赁边界自身的安全内缩距离（风轮边缘距租赁边线）(m)
+    lease_setback: float = 0.0
+
+    #: 禁建区列表。每项形如::
+    #:
+    #:     {"name": "主航道", "kind": "shipping_lane",
+    #:      "setback": 200.0, "vertices": [[x, y], ...]}
+    #:
+    #: kind 可选 shipping_lane / cable_corridor /
+    #: ecological_buffer / other；setback 为风轮边缘到该区
+    #: 的安全净距（米），各区可不同；vertices 允许凹陷。
+    exclusion_zones: list[dict] = field(default_factory=list)
+
     wind_resource_type: str = "default"
     wind_resource_params: dict = field(default_factory=lambda: {
         "num_sectors": 12,
@@ -93,6 +108,8 @@ class WindFarmConfig:
             superposition_method=data.get("superposition_method", "sum_of_squares"),
             boundary_type=data.get("boundary_type", "rectangular"),
             boundary_params=data.get("boundary_params", {}),
+            lease_setback=float(data.get("lease_setback", 0.0)),
+            exclusion_zones=list(data.get("exclusion_zones", [])),
             wind_resource_type=data.get("wind_resource_type", "default"),
             wind_resource_params=data.get("wind_resource_params", {}),
             optimization=opt_config,
@@ -110,6 +127,8 @@ class WindFarmConfig:
             "superposition_method": self.superposition_method,
             "boundary_type": self.boundary_type,
             "boundary_params": self.boundary_params,
+            "lease_setback": self.lease_setback,
+            "exclusion_zones": self.exclusion_zones,
             "wind_resource_type": self.wind_resource_type,
             "wind_resource_params": self.wind_resource_params,
             "optimization": self.optimization.__dict__,
@@ -157,6 +176,68 @@ class WindFarmConfig:
         else:
             raise ValueError(f"未知的边界类型: {self.boundary_type}")
 
+    def create_exclusion_zones(self) -> list[ExclusionZone]:
+        """根据配置创建禁建区列表（严格校验几何数据）。"""
+        zones: list[ExclusionZone] = []
+        seen_names: set[str] = set()
+        for idx, raw in enumerate(self.exclusion_zones):
+            if not isinstance(raw, dict):
+                raise GeometryValidationError(
+                    f"第 {idx + 1} 个禁建区配置必须是对象(dict)"
+                )
+
+            name = str(raw.get("name", f"禁建区{idx + 1}"))
+            if name in seen_names:
+                raise GeometryValidationError(f"禁建区名称重复: {name!r}")
+            seen_names.add(name)
+
+            kind = str(raw.get("kind", "other"))
+            if "setback" not in raw:
+                raise GeometryValidationError(
+                    f"禁建区 {name!r} 缺少必填字段 setback（安全净距 m）"
+                )
+            try:
+                setback = float(raw["setback"])
+            except (TypeError, ValueError) as exc:
+                raise GeometryValidationError(
+                    f"禁建区 {name!r} 的 setback 必须是数值"
+                ) from exc
+
+            verts_raw = raw.get("vertices")
+            if verts_raw is None:
+                raise GeometryValidationError(
+                    f"禁建区 {name!r} 缺少必填字段 vertices"
+                )
+            try:
+                vertices = np.asarray(verts_raw, dtype=np.float64).reshape(-1, 2)
+            except (TypeError, ValueError) as exc:
+                raise GeometryValidationError(
+                    f"禁建区 {name!r} 的 vertices 必须是 (N, 2) 坐标数组"
+                ) from exc
+
+            zones.append(ExclusionZone(
+                vertices=vertices,
+                setback=setback,
+                name=name,
+                kind=kind,
+            ))
+        return zones
+
+    def create_feasible_domain(
+        self,
+        boundary: "SiteBoundary | None" = None,
+        rotor_radius: float = 0.0,
+    ) -> FeasibleDomain:
+        """创建可行域：租赁边界扣除全部禁建区及其安全净距。"""
+        if boundary is None:
+            boundary = self.create_boundary()
+        return FeasibleDomain(
+            lease=boundary,
+            zones=self.create_exclusion_zones(),
+            rotor_radius=rotor_radius,
+            lease_setback=self.lease_setback,
+        )
+
     def create_wind_resource(self) -> WindResource:
         """根据配置创建风资源。"""
         wrp = self.wind_resource_params
@@ -178,7 +259,7 @@ class WindFarmConfig:
 
 
 def create_sample_config() -> WindFarmConfig:
-    """创建示例配置。"""
+    """创建示例配置（含航道、海缆走廊、生态缓冲区三类禁建区）。"""
     return WindFarmConfig(
         n_turbines=12,
         turbine_model="V126-3.45MW",
@@ -186,6 +267,35 @@ def create_sample_config() -> WindFarmConfig:
         wake_decay=0.07,
         boundary_type="rectangular",
         boundary_params={"width": 3500, "height": 3500, "center_x": 0, "center_y": 0},
+        exclusion_zones=[
+            {
+                "name": "主航道",
+                "kind": "shipping_lane",
+                "setback": 200.0,
+                "vertices": [
+                    [-1750, -300], [1750, -300],
+                    [1750, 100], [-1750, 100],
+                ],
+            },
+            {
+                "name": "35kV海缆走廊",
+                "kind": "cable_corridor",
+                "setback": 100.0,
+                "vertices": [
+                    [900, -1750], [1100, -1750],
+                    [1100, 1750], [900, 1750],
+                ],
+            },
+            {
+                "name": "近岸生态缓冲区",
+                "kind": "ecological_buffer",
+                "setback": 150.0,
+                "vertices": [
+                    [-1750, 1200], [-600, 1050],
+                    [-400, 1750], [-1750, 1750],
+                ],
+            },
+        ],
         wind_resource_type="default",
         wind_resource_params={"num_sectors": 12, "dominant_direction": 270.0, "mean_speed": 8.5},
         optimization=OptimizationConfig(

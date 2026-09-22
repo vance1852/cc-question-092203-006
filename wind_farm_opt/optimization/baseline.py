@@ -1,189 +1,150 @@
-"""基线布局生成（规则网格）。"""
+"""基线布局生成（规则网格）。
+
+所有网格点与补点都必须落在可行域内（租赁边界扣除禁建区及其安全
+净距）。无法在有限时间内容纳指定台数时抛出
+:class:`InfeasibleLayoutError`，绝不返回带违规的布局。
+"""
 
 import numpy as np
 
-from ..constraints.boundary import SiteBoundary
+from ..constraints.exclusion import FeasibleDomain, InfeasibleLayoutError
 from ..constraints.spacing import (
-    check_min_spacing,
     compute_min_spacing_from_diameters,
-    enforce_min_spacing,
 )
 
 
+def _grid_points(
+    domain: FeasibleDomain,
+    n_turbines: int,
+    min_spacing: float,
+    staggered: bool,
+) -> np.ndarray:
+    """在可行域内铺设规则（或交错）网格点。"""
+    n_rows = max(1, int(np.round(np.sqrt(n_turbines))))
+    n_cols = max(1, int(np.ceil(n_turbines / n_rows)))
+
+    x_min, x_max = domain.x_min, domain.x_max
+    y_min, y_max = domain.y_min, domain.y_max
+
+    margin = min_spacing * 0.5
+    x_range = x_max - x_min - 2 * margin
+    y_range = y_max - y_min - 2 * margin
+    if x_range <= 0 or y_range <= 0:
+        return np.zeros((0, 2), dtype=np.float64)
+
+    spacing_x = min(x_range / max(n_cols - 1, 1), min_spacing * 1.5)
+    spacing_y = min(y_range / max(n_rows - 1, 1), min_spacing * 1.5)
+    spacing_x = max(spacing_x, min_spacing)
+    spacing_y = max(spacing_y, min_spacing)
+
+    start_x = x_min + margin + (x_range - spacing_x * (n_cols - 1)) / 2.0
+    start_y = y_min + margin + (y_range - spacing_y * (n_rows - 1)) / 2.0
+
+    positions: list[np.ndarray] = []
+    for row in range(n_rows):
+        offset = spacing_x / 2.0 if (staggered and row % 2 == 1) else 0.0
+        for col in range(n_cols):
+            pos = np.array([
+                start_x + col * spacing_x + offset,
+                start_y + row * spacing_y,
+            ])
+            if not domain.contains_point(pos):
+                continue
+            if all(np.linalg.norm(pos - p) >= min_spacing for p in positions):
+                positions.append(pos)
+    return np.array(positions, dtype=np.float64) if positions else np.zeros((0, 2))
+
+
 def generate_grid_layout(
-    boundary: SiteBoundary,
+    domain: FeasibleDomain,
     n_turbines: int,
     rotor_diameters: np.ndarray,
     min_multiple: float = 5.0,
-    aspect_ratio: float = 1.0,
     rng: np.random.Generator | None = None,
+    staggered: bool = False,
+    time_budget_s: float = 20.0,
 ) -> np.ndarray:
-    """生成规则网格布局作为优化基线。
+    """生成规则网格基线，不足机位在可行域内随机补足。
 
     Parameters
     ----------
-    boundary : SiteBoundary
-        场地边界
+    domain : FeasibleDomain
+        可行域（租赁边界 − 禁建区及净距）
     n_turbines : int
         风机台数
     rotor_diameters : np.ndarray
-        每台风机的转子直径
+        每台风机转子直径
     min_multiple : float
-        最小间距倍数
-    aspect_ratio : float
-        网格纵横比 (列数/行数)
-    rng : Optional[np.random.Generator]
+        最小间距倍数（按最大转子直径）
+    rng : np.random.Generator | None
         随机数生成器
+    staggered : bool
+        是否采用交错网格
+    time_budget_s : float
+        补点/修复的总时间预算（秒）
 
     Returns
     -------
     np.ndarray
-        网格布局位置 (n_turbines, 2)
+        形状 (n_turbines, 2) 的可行机位
+
+    Raises
+    ------
+    InfeasibleLayoutError
+        可行域无法容纳该台数（携带具体约束原因）
     """
     if rng is None:
         rng = np.random.default_rng()
 
     min_spacing = compute_min_spacing_from_diameters(rotor_diameters, min_multiple)
 
-    n_rows = max(1, int(np.round(np.sqrt(n_turbines / aspect_ratio))))
-    n_cols = max(1, int(np.ceil(n_turbines / n_rows)))
+    positions = _grid_points(domain, n_turbines, min_spacing, staggered)
 
-    x_min, x_max = boundary.x_min, boundary.x_max
-    y_min, y_max = boundary.y_min, boundary.y_max
-
-    margin = min_spacing * 0.5
-    x_range = x_max - x_min - 2 * margin
-    y_range = y_max - y_min - 2 * margin
-
-    spacing_x = min(x_range / max(n_cols - 1, 1), min_spacing * 1.5)
-    spacing_y = min(y_range / max(n_rows - 1, 1), min_spacing * 1.5)
-
-    positions = []
-
-    start_x = x_min + margin + (x_range - spacing_x * (n_cols - 1)) / 2.0
-    start_y = y_min + margin + (y_range - spacing_y * (n_rows - 1)) / 2.0
-
-    count = 0
-    for row in range(n_rows):
-        for col in range(n_cols):
-            if count >= n_turbines:
-                break
-            x = start_x + col * spacing_x
-            y = start_y + row * spacing_y
-            pos = np.array([x, y])
-            if boundary.contains_point(pos):
-                positions.append(pos)
-                count += 1
-
-    while len(positions) < n_turbines:
-        candidates = boundary.sample_random_points(n_turbines * 2, rng)
-        for cand in candidates:
-            if len(positions) >= n_turbines:
-                break
-            pos_arr = np.array(positions + [cand]) if positions else np.array([cand])
-            valid, _ = check_min_spacing(pos_arr, min_spacing)
-            if valid and boundary.contains_point(cand):
-                positions.append(cand)
-
-    positions = np.array(positions, dtype=np.float64)
-
-    valid, _ = check_min_spacing(positions, min_spacing)
-    inside = boundary.contains_all(positions).all()
-
-    if not (valid and inside):
+    if positions.shape[0] < n_turbines:
+        # 网格被禁建区切碎时，用可行域内带间距的拒绝采样补足，
+        # 新点还要与已放置的网格点保持间距。
+        needed = n_turbines - positions.shape[0]
         try:
-            positions = enforce_min_spacing(positions, min_spacing, boundary, rng)
-        except RuntimeError:
-            pass
+            extra = domain.sample_separated_points(
+                needed,
+                min_spacing,
+                rng,
+                existing=positions,
+                time_budget_s=time_budget_s,
+            )
+        except InfeasibleLayoutError as err:
+            reasons = [
+                f"规则网格仅能在可行域内布置 {positions.shape[0]}/{n_turbines} 台"
+            ] + err.reasons
+            raise InfeasibleLayoutError(
+                f"基线布局失败：{err}", reasons=reasons, details=err.details
+            ) from err
+        positions = np.vstack([positions, extra])
 
-    return positions
+    report = domain.validate_layout(positions, min_spacing)
+    if not report.feasible:
+        raise InfeasibleLayoutError(
+            "基线布局生成后仍不满足约束",
+            reasons=report.reasons,
+            details={"reason": "baseline_invalid", "report": report.to_dict()},
+        )
+    return positions[:n_turbines]
 
 
 def generate_staggered_grid_layout(
-    boundary: SiteBoundary,
+    domain: FeasibleDomain,
     n_turbines: int,
     rotor_diameters: np.ndarray,
     min_multiple: float = 5.0,
     dominant_direction: float = 270.0,
     rng: np.random.Generator | None = None,
 ) -> np.ndarray:
-    """生成交错网格布局（错位排列，减少主风向下的尾流）。
-
-    Parameters
-    ----------
-    boundary : SiteBoundary
-        场地边界
-    n_turbines : int
-        风机台数
-    rotor_diameters : np.ndarray
-        每台风机的转子直径
-    min_multiple : float
-        最小间距倍数
-    dominant_direction : float
-        主风向（度），用于确定交错方向
-    rng : Optional[np.random.Generator]
-        随机数生成器
-
-    Returns
-    -------
-    np.ndarray
-        交错网格布局位置 (n_turbines, 2)
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-
-    min_spacing = compute_min_spacing_from_diameters(rotor_diameters, min_multiple)
-
-    n_rows = max(1, int(np.sqrt(n_turbines)))
-    n_cols = max(1, int(np.ceil(n_turbines / n_rows)))
-
-    x_min, x_max = boundary.x_min, boundary.x_max
-    y_min, y_max = boundary.y_min, boundary.y_max
-
-    margin = min_spacing * 0.5
-    x_range = x_max - x_min - 2 * margin
-    y_range = y_max - y_min - 2 * margin
-
-    spacing_x = max(x_range / max(n_cols - 1, 1), min_spacing * 1.2)
-    spacing_y = max(y_range / max(n_rows - 1, 1), min_spacing * 1.2)
-
-    positions = []
-
-    start_x = x_min + margin + (x_range - spacing_x * (n_cols - 1)) / 2.0
-    start_y = y_min + margin + (y_range - spacing_y * (n_rows - 1)) / 2.0
-
-    count = 0
-    for row in range(n_rows):
-        offset = spacing_x / 2.0 if row % 2 == 1 else 0.0
-        for col in range(n_cols):
-            if count >= n_turbines:
-                break
-            x = start_x + col * spacing_x + offset
-            y = start_y + row * spacing_y
-            pos = np.array([x, y])
-            if boundary.contains_point(pos):
-                positions.append(pos)
-                count += 1
-
-    while len(positions) < n_turbines:
-        candidates = boundary.sample_random_points(n_turbines * 2, rng)
-        for cand in candidates:
-            if len(positions) >= n_turbines:
-                break
-            pos_arr = np.array(positions + [cand]) if positions else np.array([cand])
-            valid, _ = check_min_spacing(pos_arr, min_spacing)
-            if valid and boundary.contains_point(cand):
-                positions.append(cand)
-
-    positions = np.array(positions, dtype=np.float64)
-
-    valid, _ = check_min_spacing(positions, min_spacing)
-    inside = boundary.contains_all(positions).all()
-
-    if not (valid and inside):
-        try:
-            positions = enforce_min_spacing(positions, min_spacing, boundary, rng)
-        except RuntimeError:
-            pass
-
-    return positions
+    """生成交错网格基线（错位排列以减少主风向尾流）。"""
+    return generate_grid_layout(
+        domain,
+        n_turbines,
+        rotor_diameters,
+        min_multiple=min_multiple,
+        rng=rng,
+        staggered=True,
+    )

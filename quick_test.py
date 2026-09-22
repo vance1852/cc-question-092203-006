@@ -46,21 +46,72 @@ deficits = np.array([0.1, 0.05, 0.08])
 total_def = superpose_wakes(deficits, method="sum_of_squares")
 print(f"   ✓ 平方和叠加: {total_def:.4f} (线性叠加: {deficits.sum():.4f})")
 
-print("\n4. 测试场地边界...")
+print("\n4. 测试场地边界与禁建区可行域...")
 from wind_farm_opt.constraints.boundary import (
     create_rectangular_boundary,
     create_irregular_boundary,
 )
+from wind_farm_opt.constraints.exclusion import (
+    ExclusionZone,
+    FeasibleDomain,
+    InfeasibleLayoutError,
+    GeometryValidationError,
+)
 boundary = create_rectangular_boundary(width=4000, height=4000)
-print(f"   ✓ 矩形场地面积: {boundary.area/1e6:.2f} km²")
+print(f"   ✓ 矩形租赁面积: {boundary.area/1e6:.2f} km²")
 
 irregular = create_irregular_boundary()
-print(f"   ✓ 不规则场地面积: {irregular.area/1e6:.2f} km²")
+print(f"   ✓ 不规则租赁面积: {irregular.area/1e6:.2f} km²")
 
 test_point = np.array([1000.0, 1000.0])
 test_outside = np.array([-5000.0, -5000.0])
-print(f"   ✓ 点在边界内: {boundary.contains_point(test_point)}")
-print(f"   ✓ 点在边界外: {boundary.contains_point(test_outside)}")
+print(f"   ✓ 点在租赁内: {boundary.contains_point(test_point)}")
+print(f"   ✓ 点在租赁外: {not boundary.contains_point(test_outside)}")
+
+# 凹陷禁建多边形：航道 + 生态缓冲区，各带不同安全净距。
+shipping_lane = ExclusionZone(
+    vertices=np.array([
+        [-2000, -300], [2000, -300], [2000, 100], [-2000, 100]
+    ], dtype=float),
+    setback=200.0, name="主航道", kind="shipping_lane",
+)
+eco_zone = ExclusionZone(
+    vertices=np.array([
+        [-2000, 1200], [-800, 1100], [-600, 2000], [-2000, 2000]
+    ], dtype=float),
+    setback=150.0, name="生态缓冲区", kind="ecological_buffer",
+)
+rotor_radius = turb.rotor_diameter / 2.0
+domain = FeasibleDomain(
+    lease=boundary,
+    zones=[shipping_lane, eco_zone],
+    rotor_radius=rotor_radius,
+)
+print(f"   ✓ 扣除禁建区后可行域面积: {domain.area/1e6:.2f} km²")
+
+# 坏几何必须被严格拒绝。
+try:
+    ExclusionZone(
+        vertices=np.array([[0, 0], [10, 10], [0, 10], [10, 0]], dtype=float),
+        setback=10.0, name="自相交多边形",
+    )
+    raise AssertionError("自相交多边形未被拒绝")
+except GeometryValidationError:
+    print("   ✓ 自相交禁建多边形被严格拒绝")
+
+# 侵入净距的点必须被识别为违规。
+too_close = np.array([0.0, 100.0 + 200.0 + rotor_radius - 5.0])
+print(f"   ✓ 侵入安全净距的点被拦截: {not domain.contains_point(too_close)}")
+
+# 过密布置必须在有限时间内失败并给出原因。
+try:
+    domain.sample_separated_points(
+        300, 5.0 * turb.rotor_diameter,
+        np.random.default_rng(0), time_budget_s=2.0,
+    )
+    raise AssertionError("不可行布置未失败")
+except InfeasibleLayoutError as exc:
+    print(f"   ✓ 过密布置限时失败: {exc.reasons[0]}")
 
 print("\n5. 测试间距约束...")
 from wind_farm_opt.constraints.spacing import (
@@ -87,10 +138,30 @@ turbines = [create_default_turbine("V126-3.45MW") for _ in range(n_turb)]
 rotor_diameters = np.array([t.rotor_diameter for t in turbines])
 
 boundary = create_rectangular_boundary(3500, 3500)
+lane = ExclusionZone(
+    vertices=np.array([
+        [-1750, -250], [1750, -250], [1750, 100], [-1750, 100]
+    ], dtype=float),
+    setback=150.0, name="航道", kind="shipping_lane",
+)
+eco = ExclusionZone(
+    vertices=np.array([
+        [-1750, 1250], [-700, 1100], [-500, 1750], [-1750, 1750]
+    ], dtype=float),
+    setback=120.0, name="生态缓冲区", kind="ecological_buffer",
+)
+domain = FeasibleDomain(
+    lease=boundary, zones=[lane, eco],
+    rotor_radius=rotor_diameters.max() / 2.0,
+)
 rng = np.random.default_rng(42)
 
-positions = generate_grid_layout(boundary, n_turb, rotor_diameters, min_multiple=5.0, rng=rng)
-print(f"   ✓ 生成 {n_turb} 台风机网格布局")
+positions = generate_grid_layout(domain, n_turb, rotor_diameters, min_multiple=5.0, rng=rng)
+report = domain.validate_layout(
+    positions, 5.0 * rotor_diameters.max()
+)
+assert report.feasible, report.reasons
+print(f"   ✓ 生成 {n_turb} 台风机网格布局，全部在可行域内、满足禁建净距与间距")
 
 wake_model = JensenWake(0.07)
 aep_calc = AEPCalculator(
@@ -127,13 +198,17 @@ fitness_fn = aep_calc.evaluate_layout
 ga = GeneticAlgorithm(
     n_turbines=n_turb,
     rotor_diameters=rotor_diameters,
-    boundary=boundary,
+    domain=domain,
     fitness_fn=fitness_fn,
     config=ga_config,
 )
 
 opt_result = ga.optimize(verbose=False)
-print(f"   ✓ 遗传算法优化完成")
+final_report = domain.validate_layout(
+    opt_result.best_positions, 5.0 * rotor_diameters.max()
+)
+assert final_report.feasible, final_report.reasons
+print(f"   ✓ 遗传算法优化完成，最终解通过全部约束（含禁建净距）")
 print(f"   ✓ 最优净AEP: {opt_result.best_fitness:.2f} MWh")
 print(f"   ✓ 基线净AEP: {result.net_aep:.2f} MWh")
 improvement = (opt_result.best_fitness - result.net_aep) / result.net_aep * 100
@@ -181,6 +256,7 @@ plot_farm_layout(
     positions, boundary, rotor_diameters,
     turbine_losses=losses,
     turbine_names=[f"#{i}" for i in range(n_turb)],
+    exclusion_zones=[lane, eco],
     save_path="test_output/layout.png",
     show=False,
 )
