@@ -1,11 +1,11 @@
 """遗传算法优化器。"""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 import numpy as np
 
-from ..constraints.boundary import SiteBoundary
+from ..constraints.geofence import Geofence, InfeasibleLayoutError
 from ..constraints.spacing import (
     check_min_spacing,
     compute_min_spacing_from_diameters,
@@ -73,6 +73,8 @@ class OptimizeResult:
         最终种群 (pop_size, N_turb*2)
     final_fitness : np.ndarray
         最终种群适应度 (pop_size,)
+    feasible : bool
+        最终解是否满足全部约束（租赁边界、禁建净距、最小间距）。
     """
 
     best_positions: np.ndarray
@@ -82,22 +84,24 @@ class OptimizeResult:
     mean_history: list[float]
     final_population: np.ndarray
     final_fitness: np.ndarray
+    feasible: bool = True
 
 
 class GeneticAlgorithm:
     """遗传算法机位优化器。
 
     优化目标：最大化年净发电量（等价于最小化尾流损失）。
-    约束：最小间距、场地边界内。
+    约束：最小间距、租赁边界内、与各禁建区保持各自的安全净距。
     """
 
     def __init__(
         self,
         n_turbines: int,
         rotor_diameters: np.ndarray,
-        boundary: SiteBoundary,
+        boundary,
         fitness_fn: Callable[[np.ndarray], float],
         config: Optional[GAConfig] = None,
+        site: Optional[Geofence] = None,
     ) -> None:
         """
         Parameters
@@ -106,16 +110,25 @@ class GeneticAlgorithm:
             风机台数
         rotor_diameters : np.ndarray
             每台风机的转子直径
-        boundary : SiteBoundary
-            场地边界
+        boundary : SiteBoundary or Geofence
+            场地边界；直接传入 Geofence 时与 ``site`` 等价。
         fitness_fn : Callable[[np.ndarray], float]
             适应度函数，输入位置数组 (N_turb, 2)，返回净AEP
         config : Optional[GAConfig]
             算法配置参数
+        site : Optional[Geofence]
+            显式指定的可行域（含禁建区）。优先于 boundary 推断。
         """
         self.n_turbines = n_turbines
         self.rotor_diameters = np.asarray(rotor_diameters, dtype=np.float64)
-        self.boundary = boundary
+
+        if site is not None:
+            self.site = site
+        elif isinstance(boundary, Geofence):
+            self.site = boundary
+        else:
+            self.site = Geofence(boundary=boundary)
+        self.boundary = self.site.boundary
         self.fitness_fn = fitness_fn
         self.config = config if config is not None else GAConfig()
 
@@ -127,8 +140,8 @@ class GeneticAlgorithm:
         )
 
         self.n_dim = n_turbines * 2
-        self.x_range = boundary.x_max - boundary.x_min
-        self.y_range = boundary.y_max - boundary.y_min
+        self.x_range = self.site.x_max - self.site.x_min
+        self.y_range = self.site.y_max - self.site.y_min
 
         self._best_positions = None
         self._best_fitness = -np.inf
@@ -140,62 +153,52 @@ class GeneticAlgorithm:
     def _initialize_population(self, pop_size: int) -> np.ndarray:
         """初始化种群。
 
-        每个个体是展平的位置向量：[x1, y1, x2, y2, ..., xn, yn]
+        每个个体是展平的位置向量：[x1, y1, x2, y2, ..., xn, yn]。
+        初始个体全部在可行域内；无法生成时抛出 InfeasibleLayoutError。
         """
         population = np.zeros((pop_size, self.n_dim), dtype=np.float64)
 
         for i in range(pop_size):
-            positions = self._generate_valid_layout()
-            population[i] = positions.flatten()
+            population[i] = self._generate_valid_layout().flatten()
 
         return population
 
     def _generate_valid_layout(self) -> np.ndarray:
-        """生成一个满足约束的初始布局。"""
-        max_attempts = 100
+        """生成一个满足全部约束（含禁建净距）的初始布局。"""
+        max_rounds = 60
 
-        for _ in range(max_attempts):
+        for _ in range(max_rounds):
             try:
-                positions = self.boundary.sample_random_points(
-                    self.n_turbines, self.rng, max_attempts=50
+                positions = self.site.sample_feasible_points(
+                    self.n_turbines, self.rng, max_attempts=20000
                 )
-                valid, _ = check_min_spacing(positions, self.min_spacing)
-                if valid:
-                    return positions
-            except RuntimeError:
-                continue
-
-            try:
-                positions = self.boundary.sample_random_points(
-                    self.n_turbines, self.rng, max_attempts=50
-                )
-                positions = enforce_min_spacing(
-                    positions, self.min_spacing, self.boundary, self.rng
-                )
+            except InfeasibleLayoutError:
+                raise
+            valid, _ = check_min_spacing(positions, self.min_spacing)
+            if valid:
                 return positions
-            except RuntimeError:
+            try:
+                return enforce_min_spacing(
+                    positions, self.min_spacing, self.site, self.rng
+                )
+            except InfeasibleLayoutError:
                 continue
 
-        raise RuntimeError("无法生成满足约束的初始布局")
+        raise InfeasibleLayoutError(
+            f"无法在可行域内为 {self.n_turbines} 台风机生成满足 "
+            f"{self.min_spacing:.0f} m 最小间距的初始布局",
+            violations=[],
+        )
 
     def _compute_penalty(self, positions_flat: np.ndarray) -> float:
-        """计算约束违反惩罚。"""
+        """计算约束违反惩罚（租赁边界 + 禁建净距 + 最小间距）。
+
+        惩罚与违反深度 (m) 成比例，使优化器获得朝可行方向移动的梯度，
+        而不是非 0 即大值的硬跳变。
+        """
         positions = positions_flat.reshape(self.n_turbines, 2)
-
-        penalty = 0.0
-
-        inside = self.boundary.contains_all(positions)
-        if not inside.all():
-            n_violations = np.sum(~inside)
-            penalty += n_violations * self.config.penalty_factor
-
-        valid, violations = check_min_spacing(positions, self.min_spacing)
-        if not valid:
-            for i, j in violations:
-                dist = np.linalg.norm(positions[i] - positions[j])
-                penalty += (self.min_spacing - dist) * self.config.penalty_factor
-
-        return penalty
+        depth = self.site.total_violation_depth(positions, self.min_spacing)
+        return depth * self.config.penalty_factor
 
     def _evaluate_population(self, population: np.ndarray) -> np.ndarray:
         """评估整个种群的适应度（带惩罚）。"""
@@ -255,23 +258,32 @@ class GeneticAlgorithm:
         return mutated
 
     def _repair(self, individual: np.ndarray) -> np.ndarray:
-        """修复违反约束的个体。"""
+        """修复违反约束的个体（投影回可行域 + 间距推开/重定位）。
+
+        修复失败（可行域确实无法容纳）时，保留原个体交由惩罚函数处理，
+        由优化结束前的最终可行性校验统一拒绝，绝不静默返回违规布局。
+        """
         positions = individual.reshape(self.n_turbines, 2)
 
         for i in range(self.n_turbines):
-            if not self.boundary.contains_point(positions[i]):
-                positions[i] = self.boundary.project_to_boundary(positions[i])
+            if not self.site.is_feasible_point(positions[i]):
+                try:
+                    positions[i] = self.site.project_into_feasible_region(
+                        positions[i], self.rng
+                    )
+                except InfeasibleLayoutError:
+                    pass
 
         valid, _ = check_min_spacing(positions, self.min_spacing)
-        inside = self.boundary.contains_all(positions).all()
+        feasible = self.site.feasible_mask(positions).all()
 
-        if not (valid and inside):
+        if not (valid and feasible):
             try:
                 positions = enforce_min_spacing(
-                    positions, self.min_spacing, self.boundary, self.rng
+                    positions, self.min_spacing, self.site, self.rng
                 )
-            except RuntimeError:
-                pass
+            except InfeasibleLayoutError:
+                return individual
 
         return positions.flatten()
 
@@ -300,7 +312,12 @@ class GeneticAlgorithm:
             print(f"最大代数: {max_gen}")
             print(f"最小间距: {self.min_spacing:.1f} m "
                   f"({self.config.min_spacing_multiple:.1f}倍转子直径)")
-            print(f"场地面积: {self.boundary.area / 1e6:.2f} km²")
+            print(f"场地面积: {self.site.area / 1e6:.2f} km²")
+            if self.site.has_exclusions:
+                print(f"禁建区: {len(self.site.exclusions)} 个")
+                for z in self.site.exclusions:
+                    print(f"  - {z.name}: 外缘净距 {z.setback:.0f} m "
+                          f"(中心限制 {z.center_setback:.0f} m)")
             print("=" * 35)
 
         population = self._initialize_population(pop_size)
@@ -360,12 +377,24 @@ class GeneticAlgorithm:
             print(f"最优净AEP: {self._best_fitness/1e3:.2f} GWh")
             print(f"找到最优解的代数: {self._best_generation}")
 
+        best_positions = self._best_positions.copy()
+        violations = self.site.diagnose(best_positions, self.min_spacing)
+        feasible = len(violations) == 0
+
+        if not feasible:
+            raise InfeasibleLayoutError(
+                "遗传算法未能在有限代数内找到满足全部约束的布局"
+                "（租赁边界、禁建净距、最小间距）",
+                violations=violations,
+            )
+
         return OptimizeResult(
-            best_positions=self._best_positions.copy(),
+            best_positions=best_positions,
             best_fitness=float(self._best_fitness),
             best_generation=self._best_generation,
             convergence_history=self.convergence_history.copy(),
             mean_history=self.mean_history.copy(),
             final_population=population.copy(),
             final_fitness=fitness.copy(),
+            feasible=feasible,
         )

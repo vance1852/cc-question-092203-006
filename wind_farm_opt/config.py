@@ -18,6 +18,7 @@ from .constraints.boundary import (
     create_hexagonal_boundary,
     create_irregular_boundary,
 )
+from .constraints.geofence import Geofence, ExclusionZone
 
 
 @dataclass
@@ -64,6 +65,11 @@ class WindFarmConfig:
         "center_y": 0,
     })
 
+    #: 禁建区列表，每项形如
+    #: ``{"name": "航道", "setback": 200.0, "vertices": [[x, y], ...]}``。
+    #: 顶点可为凹陷多边形，setback 为风轮外缘至禁建区边缘的净距 (m)。
+    exclusions: list[dict] = field(default_factory=list)
+
     wind_resource_type: str = "default"
     wind_resource_params: dict = field(default_factory=lambda: {
         "num_sectors": 12,
@@ -93,6 +99,7 @@ class WindFarmConfig:
             superposition_method=data.get("superposition_method", "sum_of_squares"),
             boundary_type=data.get("boundary_type", "rectangular"),
             boundary_params=data.get("boundary_params", {}),
+            exclusions=list(data.get("exclusions", [])),
             wind_resource_type=data.get("wind_resource_type", "default"),
             wind_resource_params=data.get("wind_resource_params", {}),
             optimization=opt_config,
@@ -110,6 +117,7 @@ class WindFarmConfig:
             "superposition_method": self.superposition_method,
             "boundary_type": self.boundary_type,
             "boundary_params": self.boundary_params,
+            "exclusions": self.exclusions,
             "wind_resource_type": self.wind_resource_type,
             "wind_resource_params": self.wind_resource_params,
             "optimization": self.optimization.__dict__,
@@ -157,6 +165,59 @@ class WindFarmConfig:
         else:
             raise ValueError(f"未知的边界类型: {self.boundary_type}")
 
+    def create_geofence(self, rotor_radius: Optional[float] = None) -> Geofence:
+        """根据配置创建可行域（租赁边界 + 禁建区及其净距）。
+
+        Parameters
+        ----------
+        rotor_radius : Optional[float]
+            风轮半径 (m)。缺省时按配置机型取转子直径的一半，使禁建净距
+            约束施加在风轮外缘而非塔架中心。
+        """
+        boundary = self.create_boundary()
+
+        if rotor_radius is None:
+            rotor_radius = float(create_default_turbine(self.turbine_model).rotor_diameter) / 2.0
+
+        zones: list[ExclusionZone] = []
+        used_names: set[str] = set()
+        for k, raw in enumerate(self.exclusions):
+            label = f"禁建区[{k}]"
+            if not isinstance(raw, dict):
+                raise ValueError(f"{label}: 配置项必须是对象，实际为 {type(raw).__name__}")
+
+            vertices = raw.get("vertices")
+            if vertices is None:
+                raise ValueError(f"{label}: 缺少 'vertices' 顶点列表")
+            try:
+                verts = np.array(vertices, dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{label}: 'vertices' 无法解析为数值坐标数组: {exc}") from None
+
+            setback = raw.get("setback", 0.0)
+            try:
+                setback = float(setback)
+            except (TypeError, ValueError):
+                raise ValueError(f"{label}: 'setback' 净距必须是数值 (m)") from None
+
+            name = str(raw.get("name") or f"禁建区_{k + 1}")
+            if name in used_names:
+                raise ValueError(f"{label}: 禁建区名称 {name!r} 重复")
+            used_names.add(name)
+
+            # ExclusionZone 构造时会完成严格几何校验；Geofence 构造时
+            # 还会校验禁建顶点均在租赁边界内。
+            zones.append(
+                ExclusionZone(
+                    vertices=verts,
+                    setback=setback,
+                    name=name,
+                    rotor_radius=rotor_radius,
+                )
+            )
+
+        return Geofence(boundary=boundary, exclusions=zones)
+
     def create_wind_resource(self) -> WindResource:
         """根据配置创建风资源。"""
         wrp = self.wind_resource_params
@@ -178,7 +239,12 @@ class WindFarmConfig:
 
 
 def create_sample_config() -> WindFarmConfig:
-    """创建示例配置。"""
+    """创建示例配置。
+
+    示例场地为 3.5 km × 3.5 km 租赁区，内含三类最新勘测图新增的禁建区：
+    航道（矩形）、海缆走廊（细长带状）与生态缓冲区（凹陷多边形），
+    各自配置不同的风轮外缘安全净距。
+    """
     return WindFarmConfig(
         n_turbines=12,
         turbine_model="V126-3.45MW",
@@ -186,6 +252,41 @@ def create_sample_config() -> WindFarmConfig:
         wake_decay=0.07,
         boundary_type="rectangular",
         boundary_params={"width": 3500, "height": 3500, "center_x": 0, "center_y": 0},
+        exclusions=[
+            {
+                "name": "航道",
+                "setback": 200.0,
+                "vertices": [
+                    [-1750.0, -400.0],
+                    [1750.0, -300.0],
+                    [1750.0, 0.0],
+                    [-1750.0, -100.0],
+                ],
+            },
+            {
+                "name": "海缆走廊",
+                "setback": 100.0,
+                "vertices": [
+                    [600.0, -1750.0],
+                    [750.0, -1750.0],
+                    [750.0, 1750.0],
+                    [600.0, 1750.0],
+                ],
+            },
+            {
+                # L 形凹陷多边形：生态缓冲区
+                "name": "生态缓冲区",
+                "setback": 150.0,
+                "vertices": [
+                    [-1600.0, 700.0],
+                    [-900.0, 700.0],
+                    [-900.0, 1100.0],
+                    [-500.0, 1100.0],
+                    [-500.0, 1600.0],
+                    [-1600.0, 1600.0],
+                ],
+            },
+        ],
         wind_resource_type="default",
         wind_resource_params={"num_sectors": 12, "dominant_direction": 270.0, "mean_speed": 8.5},
         optimization=OptimizationConfig(

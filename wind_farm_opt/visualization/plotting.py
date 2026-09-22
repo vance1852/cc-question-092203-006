@@ -15,9 +15,98 @@ from matplotlib.patches import Polygon, Circle
 from matplotlib.colors import Normalize, LinearSegmentedColormap
 
 from ..constraints.boundary import SiteBoundary
+from ..constraints.geofence import Geofence
 from ..core.wind_resource import WindResource
 from ..farm.aep import FarmResult
 from ..optimization.ga import OptimizeResult
+
+
+# 禁建区分类配色（填充/边界）
+_EXCLUSION_STYLE = {
+    "航道": ("#ff9999", "#cc0000"),
+    "海缆": ("#ffd27f", "#e67300"),
+    "生态": ("#c8a2c8", "#7a3b7a"),
+}
+
+
+def _exclusion_colors(name: str) -> tuple[str, str]:
+    for key, colors in _EXCLUSION_STYLE.items():
+        if key in name:
+            return colors
+    return ("#ffb3b3", "#b30000")
+
+
+def _draw_exclusion_zones(
+    ax,
+    site: Geofence,
+    draw_setback_line: bool = True,
+    grid_resolution: int = 140,
+) -> None:
+    """在坐标轴上绘制禁建多边形及其安全净距线。
+
+    禁建多边形用红色系斜纹填充；净距线通过对点到多边形的距离场做等值线
+    （level = 净距 + 风轮半径）得到，对凹陷多边形同样准确，且只依赖
+    numpy。
+    """
+    for zone in site.exclusions:
+        face, edge = _exclusion_colors(zone.name)
+        poly = Polygon(
+            zone.vertices,
+            facecolor=face,
+            edgecolor=edge,
+            linewidth=1.8,
+            linestyle="solid",
+            alpha=0.45,
+            hatch="//",
+            label=f"禁建区: {zone.name}",
+            zorder=3,
+        )
+        ax.add_patch(poly)
+
+        # 禁建区名称标注在多边形中心
+        centroid = np.mean(zone.vertices, axis=0)
+        ax.annotate(
+            f"{zone.name}\n净距 {zone.setback:.0f} m",
+            xy=centroid,
+            ha="center",
+            va="center",
+            fontsize=8,
+            color=edge,
+            fontweight="bold",
+            zorder=4,
+        )
+
+    if draw_setback_line and site.has_exclusions:
+        xs = np.linspace(site.x_min, site.x_max, grid_resolution)
+        ys = np.linspace(site.y_min, site.y_max, grid_resolution)
+        Xg, Yg = np.meshgrid(xs, ys)
+        pts = np.column_stack([Xg.ravel(), Yg.ravel()])
+        drawn_labels: set[str] = set()
+        for zone in site.exclusions:
+            dist = np.array([zone.point_distance(p) for p in pts]).reshape(Xg.shape)
+            _, edge = _exclusion_colors(zone.name)
+            label = None
+            if zone.name not in drawn_labels:
+                label = "禁建安全净距线（风轮外缘）"
+                drawn_labels.add(zone.name)
+            ax.contour(
+                Xg, Yg, dist,
+                levels=[zone.center_setback],
+                colors=[edge],
+                linestyles="dashed",
+                linewidths=1.2,
+                alpha=0.9,
+                zorder=2,
+            )
+            # contour 不支持直接加入图例，补一个虚线代理图元
+            if label is not None:
+                ax.plot(
+                    [], [],
+                    color="#b30000",
+                    linestyle="dashed",
+                    linewidth=1.2,
+                    label=label,
+                )
 
 
 def set_chinese_font() -> None:
@@ -38,7 +127,7 @@ def set_chinese_font() -> None:
 
 def plot_farm_layout(
     positions: np.ndarray,
-    boundary: SiteBoundary,
+    boundary,
     rotor_diameters: np.ndarray,
     turbine_losses: Optional[np.ndarray] = None,
     turbine_names: Optional[list[str]] = None,
@@ -49,12 +138,15 @@ def plot_farm_layout(
 ) -> None:
     """绘制风电场机位布局俯视图。
 
+    图中明确区分三类要素：租赁边界（绿色边框）、禁建区（红色斜纹多边形
+    及虚线净距线）、最终机位（带编号的风机圆）。
+
     Parameters
     ----------
     positions : np.ndarray
         风机位置 (N, 2)
-    boundary : SiteBoundary
-        场地边界
+    boundary : SiteBoundary or Geofence
+        场地边界或含禁建区的可行域。
     rotor_diameters : np.ndarray
         每台风机的转子直径 (N,)
     turbine_losses : Optional[np.ndarray]
@@ -72,17 +164,28 @@ def plot_farm_layout(
     """
     set_chinese_font()
 
+    site = boundary if isinstance(boundary, Geofence) else Geofence(boundary=boundary)
+
     fig, ax = plt.subplots(figsize=(10, 8))
 
     poly = Polygon(
-        boundary.vertices,
+        site.boundary.vertices,
         facecolor="lightgreen",
         edgecolor="darkgreen",
-        linewidth=2,
-        alpha=0.3,
-        label="场地边界",
+        linewidth=2.5,
+        alpha=0.18,
+        label="租赁边界",
+        zorder=1,
     )
     ax.add_patch(poly)
+    # 再叠加一条更醒目的租赁边界线
+    lease_pts = np.vstack([site.boundary.vertices, site.boundary.vertices[:1]])
+    ax.plot(
+        lease_pts[:, 0], lease_pts[:, 1],
+        color="darkgreen", linewidth=2.5, zorder=2,
+    )
+
+    _draw_exclusion_zones(ax, site)
 
     if turbine_losses is not None:
         norm = Normalize(vmin=0, vmax=max(30.0, np.max(turbine_losses)))
@@ -90,7 +193,8 @@ def plot_farm_layout(
 
         for i, (pos, d, loss) in enumerate(zip(positions, rotor_diameters, turbine_losses)):
             color = cmap(norm(loss))
-            circle = Circle(pos, d / 2.0, facecolor=color, edgecolor="black", linewidth=1.5, alpha=0.8)
+            circle = Circle(pos, d / 2.0, facecolor=color, edgecolor="black",
+                            linewidth=1.5, alpha=0.9, zorder=5)
             ax.add_patch(circle)
 
             if turbine_names is not None:
@@ -102,6 +206,7 @@ def plot_farm_layout(
                     va="center",
                     fontsize=9,
                     fontweight="bold",
+                    zorder=6,
                 )
 
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
@@ -110,7 +215,8 @@ def plot_farm_layout(
         cbar.set_label("尾流损失 (%)")
     else:
         for i, (pos, d) in enumerate(zip(positions, rotor_diameters)):
-            circle = Circle(pos, d / 2.0, facecolor="steelblue", edgecolor="darkblue", linewidth=1.5, alpha=0.7)
+            circle = Circle(pos, d / 2.0, facecolor="steelblue", edgecolor="darkblue",
+                            linewidth=1.5, alpha=0.85, zorder=5)
             ax.add_patch(circle)
 
             if turbine_names is not None:
@@ -123,6 +229,7 @@ def plot_farm_layout(
                     fontsize=9,
                     color="white",
                     fontweight="bold",
+                    zorder=6,
                 )
 
     if wake_interactions is not None:
@@ -134,25 +241,33 @@ def plot_farm_layout(
                     "r-",
                     alpha=min(0.8, intensity * 5),
                     linewidth=0.5 + intensity * 3,
+                    zorder=4,
                 )
 
     margin = 0.1
-    x_range = boundary.x_max - boundary.x_min
-    y_range = boundary.y_max - boundary.y_min
+    x_range = site.x_max - site.x_min
+    y_range = site.y_max - site.y_min
     ax.set_xlim(
-        boundary.x_min - margin * x_range,
-        boundary.x_max + margin * x_range,
+        site.x_min - margin * x_range,
+        site.x_max + margin * x_range,
     )
     ax.set_ylim(
-        boundary.y_min - margin * y_range,
-        boundary.y_max + margin * y_range,
+        site.y_min - margin * y_range,
+        site.y_max + margin * y_range,
     )
     ax.set_aspect("equal")
     ax.set_xlabel("X 坐标 (m)")
     ax.set_ylabel("Y 坐标 (m)")
     ax.set_title(title, fontsize=14, fontweight="bold")
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper right")
+
+    # 同名图元去重后再生成图例（多个禁建区可能产生相同代理标签）
+    handles, labels = ax.get_legend_handles_labels()
+    unique = dict(zip(labels, handles))
+    ax.legend(
+        unique.values(), unique.keys(),
+        loc="upper right", fontsize=9, framealpha=0.9,
+    )
 
     plt.tight_layout()
 
@@ -588,7 +703,7 @@ def plot_comparison(
 
 def plot_wake_heatmap(
     positions: np.ndarray,
-    boundary: SiteBoundary,
+    boundary,
     wake_model,
     wind_direction: float,
     rotor_diameters: np.ndarray,
@@ -604,8 +719,8 @@ def plot_wake_heatmap(
     ----------
     positions : np.ndarray
         风机位置 (N, 2)
-    boundary : SiteBoundary
-        场地边界
+    boundary : SiteBoundary or Geofence
+        场地边界或含禁建区的可行域；禁建区及其净距范围会被遮罩并叠加显示。
     wake_model
         尾流模型实例
     wind_direction : float
@@ -625,10 +740,12 @@ def plot_wake_heatmap(
     """
     set_chinese_font()
 
+    site = boundary if isinstance(boundary, Geofence) else Geofence(boundary=boundary)
+
     fig, ax = plt.subplots(figsize=(10, 8))
 
-    x = np.linspace(boundary.x_min, boundary.x_max, grid_resolution)
-    y = np.linspace(boundary.y_min, boundary.y_max, grid_resolution)
+    x = np.linspace(site.x_min, site.x_max, grid_resolution)
+    y = np.linspace(site.y_min, site.y_max, grid_resolution)
     X, Y = np.meshgrid(x, y)
 
     wind_rad = np.deg2rad(270.0 - wind_direction)
@@ -675,13 +792,10 @@ def plot_wake_heatmap(
 
     deficit_field = np.clip(deficit_field, 0.0, 1.0)
 
-    mask = np.zeros_like(deficit_field, dtype=bool)
-    for xi in range(grid_resolution):
-        for yi in range(grid_resolution):
-            pt = np.array([X[yi, xi], Y[yi, xi]])
-            mask[yi, xi] = not boundary.contains_point(pt)
-
-    deficit_masked = np.ma.masked_where(mask, deficit_field)
+    # 遮罩租赁边界外以及禁建区（含净距范围）的网格点
+    grid_points = np.column_stack([X.ravel(), Y.ravel()])
+    feasible = site.feasible_mask(grid_points).reshape(X.shape)
+    deficit_masked = np.ma.masked_where(~feasible, deficit_field)
 
     contour = ax.contourf(
         X, Y, deficit_masked * 100,
@@ -690,35 +804,43 @@ def plot_wake_heatmap(
         alpha=0.7,
     )
 
+    # 租赁边界
     poly = Polygon(
-        boundary.vertices,
+        site.boundary.vertices,
         facecolor="none",
-        edgecolor="black",
-        linewidth=2,
+        edgecolor="darkgreen",
+        linewidth=2.5,
+        zorder=4,
     )
     ax.add_patch(poly)
 
+    # 禁建区及其净距线
+    _draw_exclusion_zones(ax, site, draw_setback_line=True)
+
     for pos, d in zip(positions, rotor_diameters):
-        circle = Circle(pos, d / 2.0, facecolor="white", edgecolor="blue", linewidth=2)
+        circle = Circle(pos, d / 2.0, facecolor="white", edgecolor="blue",
+                        linewidth=2, zorder=6)
         ax.add_patch(circle)
 
     ax.quiver(
-        boundary.x_max - 200,
-        boundary.y_max - 200,
+        site.x_max - 200,
+        site.y_max - 200,
         wind_vec[0],
         wind_vec[1],
         scale=5,
         width=0.02,
         color="blue",
+        zorder=6,
     )
     ax.text(
-        boundary.x_max - 200,
-        boundary.y_max - 400,
+        site.x_max - 200,
+        site.y_max - 400,
         f"风向 {wind_direction:.0f}°",
         ha="center",
         va="top",
         fontsize=10,
         color="blue",
+        zorder=6,
     )
 
     cbar = fig.colorbar(contour, ax=ax, fraction=0.046, pad=0.04)

@@ -17,6 +17,7 @@ from .core.turbine import Turbine
 from .core.wind_resource import WindResource
 from .core.wake import WakeModel
 from .constraints.boundary import SiteBoundary
+from .constraints.geofence import Geofence, InfeasibleLayoutError
 from .farm.aep import AEPCalculator, FarmResult
 from .optimization.baseline import generate_grid_layout
 from .optimization.ga import GeneticAlgorithm, GAConfig
@@ -53,6 +54,17 @@ class WindFarmOptimizerCLI:
         self.rotor_diameters = np.array([t.rotor_diameter for t in self.turbines])
         self.rated_powers = np.array([t.rated_power for t in self.turbines])
         self.thrust_coefficients = np.array([t.thrust_coefficient for t in self.turbines])
+
+        # 可行域：租赁边界扣除带各自净距的禁建区（净距施加于风轮外缘）
+        rotor_radius = float(np.max(self.rotor_diameters)) / 2.0
+        self.site = config.create_geofence(rotor_radius=rotor_radius)
+        if self.site.has_exclusions:
+            print(f"已加载 {len(self.site.exclusions)} 个禁建区:")
+            for z in self.site.exclusions:
+                print(
+                    f"  - {z.name}: {len(z.vertices)} 个顶点（可为凹陷多边形）, "
+                    f"外缘净距 {z.setback:.0f} m，中心限制 {z.center_setback:.0f} m"
+                )
 
         self.aep_calc = AEPCalculator(
             turbines=self.turbines,
@@ -102,17 +114,31 @@ class WindFarmOptimizerCLI:
 
         rng = np.random.default_rng(self.config.optimization.seed)
         self.baseline_positions = generate_grid_layout(
-            boundary=self.boundary,
+            site=self.site,
             n_turbines=self.config.n_turbines,
             rotor_diameters=self.rotor_diameters,
             min_multiple=self.config.optimization.min_spacing_multiple,
             rng=rng,
         )
 
+        self._verify_layout(self.baseline_positions, "基线布局")
+
         print(f"已生成 {self.config.n_turbines} 台风机的网格布局")
 
         self.baseline_result = self.aep_calc.compute_farm_aep(self.baseline_positions)
         self._print_result_summary(self.baseline_result, "基线布局")
+
+    def _verify_layout(self, positions: np.ndarray, label: str) -> None:
+        """对最终机位执行全部约束校验，违规即失败（绝不静默放行）。"""
+        min_spacing = float(
+            self.config.optimization.min_spacing_multiple * np.max(self.rotor_diameters)
+        )
+        violations = self.site.diagnose(positions, min_spacing)
+        if violations:
+            raise InfeasibleLayoutError(
+                f"{label}未通过最终约束校验（{len(violations)} 条违反）",
+                violations=violations,
+            )
 
     def run_optimization(self) -> None:
         """运行机位优化。"""
@@ -132,7 +158,7 @@ class WindFarmOptimizerCLI:
             optimizer = GeneticAlgorithm(
                 n_turbines=self.config.n_turbines,
                 rotor_diameters=self.rotor_diameters,
-                boundary=self.boundary,
+                boundary=self.site,
                 fitness_fn=fit_fn,
                 config=ga_config,
             )
@@ -146,7 +172,7 @@ class WindFarmOptimizerCLI:
             optimizer = ParticleSwarmOptimizer(
                 n_turbines=self.config.n_turbines,
                 rotor_diameters=self.rotor_diameters,
-                boundary=self.boundary,
+                boundary=self.site,
                 fitness_fn=fit_fn,
                 config=pso_config,
             )
@@ -157,6 +183,8 @@ class WindFarmOptimizerCLI:
         self.optimize_result = optimizer.optimize(verbose=True)
 
         self.optimized_positions = self.optimize_result.best_positions
+        self._verify_layout(self.optimized_positions, "优化布局")
+
         self.optimized_result = self.aep_calc.compute_farm_aep(self.optimized_positions)
 
         print("\n--- 优化后结果 ---")
@@ -268,7 +296,7 @@ class WindFarmOptimizerCLI:
 
             try:
                 positions = generate_grid_layout(
-                    boundary=self.boundary,
+                    site=self.site,
                     n_turbines=n,
                     rotor_diameters=self.rotor_diameters,
                     min_multiple=self.config.optimization.min_spacing_multiple,
@@ -289,6 +317,8 @@ class WindFarmOptimizerCLI:
                 sweep_data["lcoe"].append(econ_result.lcoe)
 
                 print(f"    净AEP: {result.net_aep/1e3:.1f} GWh, LCOE: {econ_result.lcoe:.3f} 元/kWh")
+            except InfeasibleLayoutError as e:
+                print(f"    跳过（不可行）: {e}")
             except Exception as e:
                 print(f"    跳过: {e}")
 
@@ -317,11 +347,11 @@ class WindFarmOptimizerCLI:
             baseline_losses = np.array([tr.wake_loss_pct for tr in self.baseline_result.turbine_results])
             plot_farm_layout(
                 positions=self.baseline_positions,
-                boundary=self.boundary,
+                boundary=self.site,
                 rotor_diameters=self.rotor_diameters,
                 turbine_losses=baseline_losses,
                 turbine_names=[f"#{i}" for i in range(len(self.baseline_positions))],
-                title="基线网格布局 - 尾流损失分布",
+                title="基线网格布局 - 租赁边界/禁建区/机位",
                 save_path=os.path.join(save_dir, "baseline_layout.png") if save else None,
                 show=show,
             )
@@ -337,11 +367,11 @@ class WindFarmOptimizerCLI:
             opt_losses = np.array([tr.wake_loss_pct for tr in self.optimized_result.turbine_results])
             plot_farm_layout(
                 positions=self.optimized_positions,
-                boundary=self.boundary,
+                boundary=self.site,
                 rotor_diameters=self.rotor_diameters,
                 turbine_losses=opt_losses,
                 turbine_names=[f"#{i}" for i in range(len(self.optimized_positions))],
-                title="优化后布局 - 尾流损失分布",
+                title="优化后布局 - 租赁边界/禁建区/机位",
                 save_path=os.path.join(save_dir, "optimized_layout.png") if save else None,
                 show=show,
             )
@@ -385,7 +415,7 @@ class WindFarmOptimizerCLI:
             dominant_dir = self.wind_resource.directions[np.argmax(self.wind_resource.frequencies)]
             plot_wake_heatmap(
                 positions=self.optimized_positions,
-                boundary=self.boundary,
+                boundary=self.site,
                 wake_model=self.wake_model,
                 wind_direction=dominant_dir,
                 rotor_diameters=self.rotor_diameters,
@@ -411,6 +441,17 @@ class WindFarmOptimizerCLI:
             "site": {
                 "area_km2": float(self.boundary.area / 1e6),
                 "mean_wind_speed": float(self.wind_resource.overall_mean_speed),
+                "feasible_region": self.site.summary(),
+                "lease_vertices": self.boundary.vertices.tolist(),
+                "exclusions": [
+                    {
+                        "name": z.name,
+                        "setback_m": z.setback,
+                        "center_setback_m": z.center_setback,
+                        "vertices": z.vertices.tolist(),
+                    }
+                    for z in self.site.exclusions
+                ],
             },
         }
 
@@ -506,7 +547,16 @@ class WindFarmOptimizerCLI:
         print(f"  风机: {self.config.turbine_model} x {self.config.n_turbines} 台")
         print(f"  尾流模型: {self.config.wake_model}")
         print(f"  平均风速: {self.wind_resource.overall_mean_speed:.2f} m/s")
-        print(f"  场地面积: {self.boundary.area / 1e6:.2f} km²")
+        print(f"  租赁场地面积: {self.boundary.area / 1e6:.2f} km²")
+        if self.site.has_exclusions:
+            print(f"  禁建区: {len(self.site.exclusions)} 个")
+            for z in self.site.exclusions:
+                print(
+                    f"    - {z.name}: 面积 {z.area/1e6:.3f} km²，"
+                    f"外缘净距 {z.setback:.0f} m"
+                )
+        else:
+            print("  禁建区: 无")
 
         if run_baseline:
             self.run_baseline()
@@ -782,11 +832,11 @@ def main() -> int:
     if args.no_economic:
         config.economic.enable_analysis = False
 
-    cli = WindFarmOptimizerCLI(config)
-    cli._min_turbines = args.min_turbines
-    cli._max_turbines = args.max_turbines
-
     try:
+        cli = WindFarmOptimizerCLI(config)
+        cli._min_turbines = args.min_turbines
+        cli._max_turbines = args.max_turbines
+
         cli.run_full_analysis(
             run_baseline=True,
             run_opt=not args.no_optimization,
@@ -796,6 +846,17 @@ def main() -> int:
             save=True,
         )
         return 0
+    except InfeasibleLayoutError as e:
+        print("\n" + "=" * 60, file=sys.stderr)
+        print("  方案不可行：在有限时间内未能找到满足全部约束的布局", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+        print(e.violation_report(), file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+        return 2
+    except ValueError as e:
+        # 配置/几何数据校验失败
+        print(f"\n配置或几何数据无效: {e}", file=sys.stderr)
+        return 3
     except Exception as e:
         print(f"\n错误: {e}", file=sys.stderr)
         import traceback
